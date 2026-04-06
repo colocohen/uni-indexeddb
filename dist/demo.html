@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>uni-indexeddb demo</title>
+    <script src="uni-indexeddb.js"></script>
+    <style>
+        body { font-family: monospace; padding: 20px; background: #1a1a1a; color: #e0e0e0; }
+        input { padding: 6px 10px; background: #222; color: #e0e0e0; border: 1px solid #555; font-family: monospace; font-size: 14px; width: 200px; }
+        button { margin: 4px; padding: 8px 16px; cursor: pointer; background: #333; color: #e0e0e0; border: 1px solid #555; font-family: monospace; }
+        button:hover { background: #444; }
+        .row { margin: 8px 0; display: flex; align-items: center; gap: 8px; }
+        label { width: 60px; color: #888; }
+        #log { white-space: pre-wrap; background: #111; padding: 16px; margin-top: 16px; border: 1px solid #333; max-height: 500px; overflow-y: auto; font-size: 13px; }
+        h2 { color: #aaa; margin-bottom: 20px; }
+        hr { border: none; border-top: 1px solid #333; margin: 16px 0; }
+    </style>
+</head>
+<body>
+    <h2>uni-indexeddb</h2>
+
+    <div class="row">
+        <label>table</label>
+        <input id="table" value="users" placeholder="table name">
+    </div>
+    <div class="row">
+        <label>key</label>
+        <input id="key" value="user:1" placeholder="key (string or number)">
+    </div>
+    <div class="row">
+        <label>value</label>
+        <input id="value" value='{"name":"Dan","age":30}' placeholder="value (JSON or text)">
+    </div>
+
+    <hr>
+
+    <button onclick="doPut()">put</button>
+    <button onclick="doGet()">get</button>
+    <button onclick="doDelete()">delete</button>
+    <button onclick="doScan()">scan table</button>
+    <button onclick="doStat()">stat</button>
+    <button onclick="doPutMany()">put 100 rows</button>
+    <button onclick="clearLog()">clear log</button>
+
+    <div id="log"></div>
+
+<script>
+var db = uniIndexedDB();
+var enc = new TextEncoder();
+var dec = new TextDecoder();
+
+function $(id) { return document.getElementById(id).value; }
+
+function log(msg) {
+    var el = document.getElementById('log');
+    el.textContent += msg + '\n';
+    el.scrollTop = el.scrollHeight;
+}
+function clearLog() { document.getElementById('log').textContent = ''; }
+
+function parseKey(k) {
+    if (/^\d+$/.test(k)) return parseInt(k, 10);
+    return k;
+}
+
+function doPut() {
+    var table = $('table');
+    var key = parseKey($('key'));
+    var val = enc.encode($('value'));
+    db.put(table, [[key, val]], function(err, count) {
+        if (err) return log('ERROR put: ' + JSON.stringify(err));
+        log('put → ' + table + '/' + key + ' = ' + $('value'));
+    });
+}
+
+function doGet() {
+    var table = $('table');
+    var key = parseKey($('key'));
+    db.get(table, [key], function(err, rows) {
+        if (err) return log('ERROR get: ' + JSON.stringify(err));
+        var val = rows[key];
+        log('get → ' + table + '/' + key + ' = ' + (val ? dec.decode(val) : 'null'));
+    });
+}
+
+function doDelete() {
+    var table = $('table');
+    var key = parseKey($('key'));
+    db.put(table, [[key, null]], function(err) {
+        if (err) return log('ERROR delete: ' + JSON.stringify(err));
+        log('del → ' + table + '/' + key);
+    });
+}
+
+function doScan() {
+    var table = $('table');
+    var count = 0;
+    log('--- scan ' + table + ' ---');
+    function next(cursor) {
+        db.scan(table, cursor, function(err, rows, nextCursor, done) {
+            if (err) return log('ERROR scan: ' + JSON.stringify(err));
+            for (var i = 0; i < rows.length; i++) {
+                count++;
+                log('  ' + rows[i][0] + ' → ' + dec.decode(rows[i][1]));
+            }
+            if (done) log('--- ' + count + ' rows ---');
+            else next(nextCursor);
+        });
+    }
+    next(null);
+}
+
+function doStat() {
+    var table = $('table');
+    db.stat(table, function(err, info) {
+        if (err) return log('ERROR stat: ' + JSON.stringify(err));
+        log('stat → ' + table + ' — count: ' + info.count + ', status: ' + info.status);
+    });
+}
+
+function doPutMany() {
+    var table = $('table');
+    var data = [];
+    for (var i = 0; i < 100; i++) {
+        data.push(['item:' + String(i).padStart(4, '0'), enc.encode(JSON.stringify({ index: i, ts: Date.now() }))]);
+    }
+    db.put(table, data, function(err, count) {
+        if (err) return log('ERROR put: ' + JSON.stringify(err));
+        log('put → ' + count + ' rows into ' + table);
+    });
+}
+</script>
+</body>
+</html>
