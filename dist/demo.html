@@ -39,8 +39,18 @@
     <button onclick="doDelete()">delete</button>
     <button onclick="doScan()">scan table</button>
     <button onclick="doStat()">stat</button>
+    <button onclick="doCount()">count</button>
     <button onclick="doPutMany()">put 100 rows</button>
+
+    <hr>
+
+    <button onclick="doTables()">tables</button>
+    <button onclick="doDrop()">drop table</button>
+    <button onclick="doExport()">export ↓</button>
+    <button onclick="doImport()">import ↑</button>
     <button onclick="clearLog()">clear log</button>
+
+    <input type="file" id="importFile" accept=".udb" style="display:none">
 
     <div id="log"></div>
 
@@ -118,6 +128,14 @@ function doStat() {
     });
 }
 
+function doCount() {
+    var table = $('table');
+    db.count(table, function(err, n) {
+        if (err) return log('ERROR count: ' + JSON.stringify(err));
+        log('count → ' + table + ' — ' + n + ' records');
+    });
+}
+
 function doPutMany() {
     var table = $('table');
     var data = [];
@@ -128,6 +146,61 @@ function doPutMany() {
         if (err) return log('ERROR put: ' + JSON.stringify(err));
         log('put → ' + count + ' rows into ' + table);
     });
+}
+
+function doTables() {
+    db.tables(function(err, list) {
+        if (err) return log('ERROR tables: ' + JSON.stringify(err));
+        log('tables → ' + (list.length ? list.join(', ') : '(none)'));
+    });
+}
+
+function doDrop() {
+    var table = $('table');
+    if (!confirm('Drop table "' + table + '"?')) return;
+    db.drop(table, function(err) {
+        if (err) return log('ERROR drop: ' + JSON.stringify(err));
+        log('drop → ' + table + ' deleted');
+    });
+}
+
+function doExport() {
+    var table = $('table');
+    var chunks = [];
+    var t0 = Date.now();
+    db.export(table, function(err, chunk, done) {
+        if (err) return log('ERROR export: ' + JSON.stringify(err));
+        if (chunk) chunks.push(chunk);
+        if (done) {
+            var blob = new Blob(chunks);
+            var a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = table + '.udb';
+            a.click();
+            log('export → ' + table + '.udb (' + blob.size + ' bytes, ' + (Date.now() - t0) + 'ms)');
+        }
+    });
+}
+
+function doImport() {
+    var input = document.getElementById('importFile');
+    input.onchange = function() {
+        if (!input.files.length) return;
+        var file = input.files[0];
+        var table = $('table');
+        var t0 = Date.now();
+        var reader = new FileReader();
+        reader.onload = function() {
+            var buf = new Uint8Array(reader.result);
+            db.import(table, buf, function(err, count) {
+                if (err) return log('ERROR import: ' + JSON.stringify(err));
+                log('import → ' + count + ' records into ' + table + ' from ' + file.name + ' (' + (Date.now() - t0) + 'ms)');
+            });
+        };
+        reader.readAsArrayBuffer(file);
+        input.value = '';
+    };
+    input.click();
 }
 </script>
 </body>

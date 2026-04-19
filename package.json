@@ -1,6 +1,6 @@
 {
   "name": "uni-indexeddb",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Unified key-value storage for browser and server. IndexedDB in the browser, LevelDB on the server. Same API everywhere.",
   "main": "index.js",
   "module": "index.mjs",

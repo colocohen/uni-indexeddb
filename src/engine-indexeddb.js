@@ -14,9 +14,8 @@ var IDLE_CLOSE_MS = 15 * 1000;
 var STORE_NAME = 'data';
 
 module.exports = function createEngine(opts) {
-    var prefix = (opts && opts.prefix) ? opts.prefix : '';
     var shuttingDown = false;
-    var tables = Object.create(null);
+    var openTables = Object.create(null);
 
     // =====================================================================
     // Table state
@@ -32,9 +31,8 @@ module.exports = function createEngine(opts) {
     }
 
     function getTable(table) {
-        var name = prefix ? prefix + '_' + table : table;
-        if (!tables[name]) tables[name] = createTableState(name);
-        return tables[name];
+        if (!openTables[table]) openTables[table] = createTableState(table);
+        return openTables[table];
     }
 
     // =====================================================================
@@ -67,10 +65,11 @@ module.exports = function createEngine(opts) {
 
     function scan(table, cursor, cb) {
         if (shuttingDown) return cb({ code: 'SHUTTING_DOWN' });
+        var o = parseScanOpts(cursor);
         var t = getTable(table);
         ensureOpen(t, false, function(err) {
             if (err) return cb(null, [], null, true);
-            scanChunk(t, cursor, function(err2, rows, nextCursor, done) {
+            scanChunk(t, o.after, o.limit, function(err2, rows, nextCursor, done) {
                 if (err2) return cb(null, [], null, true);
                 startIdle(t);
                 cb(null, rows, nextCursor, done);
@@ -83,16 +82,65 @@ module.exports = function createEngine(opts) {
         var t = getTable(table);
         ensureOpen(t, false, function(err) {
             if (err) return cb(null, { count: 0, size: 0, status: t.status });
-            countRecords(t, function(count) {
+            countRecords(t, function(n) {
                 startIdle(t);
-                cb(null, { count: count, size: 0, status: t.status });
+                cb(null, { count: n, size: 0, status: t.status });
             });
         });
     }
 
+    function count(table, cb) {
+        if (shuttingDown) return cb({ code: 'SHUTTING_DOWN' });
+        var t = getTable(table);
+        ensureOpen(t, false, function(err) {
+            if (err) return cb(null, 0);
+            countRecords(t, function(n) {
+                startIdle(t);
+                cb(null, n);
+            });
+        });
+    }
+
+    function listTables(cb) {
+        var idb = typeof indexedDB !== 'undefined' ? indexedDB : self.indexedDB;
+        if (!idb) return cb(null, []);
+        if (typeof idb.databases === 'function') {
+            idb.databases().then(function(list) {
+                var result = [];
+                for (var i = 0; i < list.length; i++) {
+                    if (list[i].name) result.push(list[i].name);
+                }
+                cb(null, result.sort());
+            }).catch(function() { cb(null, []); });
+        } else {
+            // Fallback: return tables we've seen in this session
+            cb(null, Object.keys(openTables).sort());
+        }
+    }
+
+    function drop(table, cb) {
+        if (shuttingDown) return cb({ code: 'SHUTTING_DOWN' });
+        var t = openTables[table];
+        if (t) {
+            cancelIdle(t);
+            if (t.db) { try { t.db.close(); } catch (e) {} }
+            t.db = null;
+            t.status = 'closed';
+            delete openTables[table];
+        }
+        var idb = typeof indexedDB !== 'undefined' ? indexedDB : self.indexedDB;
+        if (!idb) return cb(null);
+        var req = idb.deleteDatabase(table);
+        req.onsuccess = function() { cb(null); };
+        req.onerror = function() { cb({ code: 'DROP_FAILED', message: req.error ? req.error.message : 'Drop failed' }); };
+        req.onblocked = function() {
+            // Another connection — onsuccess will fire once unblocked
+        };
+    }
+
     function close(cb) {
         shuttingDown = true;
-        var allNames = Object.keys(tables);
+        var allNames = Object.keys(openTables);
         var remaining = 0;
         var allCounted = false;
 
@@ -102,7 +150,7 @@ module.exports = function createEngine(opts) {
         }
 
         for (var i = 0; i < allNames.length; i++) {
-            var t = tables[allNames[i]];
+            var t = openTables[allNames[i]];
             cancelIdle(t);
             if (t.processing) {
                 remaining++;
@@ -121,6 +169,16 @@ module.exports = function createEngine(opts) {
 
         allCounted = true;
         if (remaining === 0) cb(null);
+    }
+
+    // =====================================================================
+    // Scan options parser
+    // =====================================================================
+
+    function parseScanOpts(cursor) {
+        if (cursor === null || cursor === undefined) return { after: null, limit: 0 };
+        if (typeof cursor === 'string' || typeof cursor === 'number') return { after: cursor, limit: 0 };
+        return { after: cursor.after || null, limit: cursor.limit || 0 };
     }
 
     // =====================================================================
@@ -183,7 +241,6 @@ module.exports = function createEngine(opts) {
             return cb({ code: 'NO_INDEXEDDB', message: 'indexedDB not available' });
         }
 
-        // database-per-table: always version 1, one object store
         var request = idb.open(t.name, 1);
 
         request.onupgradeneeded = function(e) {
@@ -207,7 +264,6 @@ module.exports = function createEngine(opts) {
                 t.status = 'closed';
             };
 
-            // If createIfMissing is false and store doesn't exist, treat as error
             if (!createIfMissing && !t.db.objectStoreNames.contains(STORE_NAME)) {
                 t.db.close(); t.db = null; t.status = 'error';
                 return cb({ code: 'TABLE_NOT_FOUND' });
@@ -221,10 +277,7 @@ module.exports = function createEngine(opts) {
             cb({ code: 'OPEN_FAILED', message: request.error ? request.error.message : 'Unknown error' });
         };
 
-        request.onblocked = function() {
-            // Another connection is open — wait for it to close
-            // onupgradeneeded/onsuccess will fire once unblocked
-        };
+        request.onblocked = function() {};
     }
 
     function closeTable(t, cb) {
@@ -412,9 +465,9 @@ module.exports = function createEngine(opts) {
     // Scan — cursor-based chunked iteration
     // =====================================================================
 
-    function scanChunk(t, cursor, cb) {
+    function scanChunk(t, after, limit, cb) {
         t.scanning = true;
-        var pre = cursor === null ? flushWrites : noop;
+        var pre = after === null ? flushWrites : noop;
         pre(t, function() {
             var tx;
             try {
@@ -426,9 +479,9 @@ module.exports = function createEngine(opts) {
 
             var store = tx.objectStore(STORE_NAME);
             var range = null;
-            if (cursor !== null) {
-                var cursorBuf = keys.toKeyBuffer(cursor);
-                range = IDBKeyRange.lowerBound(cursorBuf, true); // exclusive
+            if (after !== null) {
+                var cursorBuf = keys.toKeyBuffer(after);
+                range = IDBKeyRange.lowerBound(cursorBuf, true);
             }
 
             var request = store.openCursor(range);
@@ -447,7 +500,7 @@ module.exports = function createEngine(opts) {
                 rows.push([key, value]);
                 bytes += value.byteLength;
 
-                if (bytes >= CHUNK_BYTES) {
+                if (bytes >= CHUNK_BYTES || (limit > 0 && rows.length >= limit)) {
                     t.scanning = false;
                     return cb(null, rows, key, false);
                 }
@@ -465,7 +518,7 @@ module.exports = function createEngine(opts) {
     function noop(t, cb) { cb(); }
 
     // =====================================================================
-    // Count
+    // Count — O(1) via IDBObjectStore.count()
     // =====================================================================
 
     function countRecords(t, cb) {
@@ -508,6 +561,9 @@ module.exports = function createEngine(opts) {
         get: get,
         scan: scan,
         stat: stat,
+        count: count,
+        tables: listTables,
+        drop: drop,
         close: close
     };
 };

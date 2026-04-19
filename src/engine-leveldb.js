@@ -18,7 +18,7 @@ module.exports = function createEngine(opts) {
     var ClassicLevel = require('classic-level').ClassicLevel;
     var dir = opts && opts.dir ? opts.dir : './data';
     var shuttingDown = false;
-    var tables = Object.create(null);
+    var openTables = Object.create(null);
 
     // =====================================================================
     // Table state
@@ -35,8 +35,8 @@ module.exports = function createEngine(opts) {
 
     function getTable(table) {
         var dbPath = path.join(dir, table);
-        if (!tables[dbPath]) tables[dbPath] = createTableState(dbPath);
-        return tables[dbPath];
+        if (!openTables[dbPath]) openTables[dbPath] = createTableState(dbPath);
+        return openTables[dbPath];
     }
 
     // =====================================================================
@@ -69,10 +69,11 @@ module.exports = function createEngine(opts) {
 
     function scan(table, cursor, cb) {
         if (shuttingDown) return cb({ code: 'SHUTTING_DOWN' });
+        var o = parseScanOpts(cursor);
         var t = getTable(table);
         ensureOpen(t, false, function(err) {
             if (err) return cb(null, [], null, true);
-            scanChunk(t, cursor, function(err2, rows, nextCursor, done) {
+            scanChunk(t, o.after, o.limit, function(err2, rows, nextCursor, done) {
                 if (err2) return cb(null, [], null, true);
                 startIdle(t);
                 cb(null, rows, nextCursor, done);
@@ -89,9 +90,60 @@ module.exports = function createEngine(opts) {
         });
     }
 
+    function count(table, cb) {
+        if (shuttingDown) return cb({ code: 'SHUTTING_DOWN' });
+        var t = getTable(table);
+        ensureOpen(t, false, function(err) {
+            if (err) return cb(null, 0);
+            countRecords(t, function(n) {
+                startIdle(t);
+                cb(null, n);
+            });
+        });
+    }
+
+    function listTables(cb) {
+        fs.readdir(dir, function(err, entries) {
+            if (err) return cb(null, []);
+            var result = [];
+            var remaining = entries.length;
+            if (remaining === 0) return cb(null, []);
+            for (var i = 0; i < entries.length; i++) {
+                (function(name) {
+                    fs.stat(path.join(dir, name), function(err2, s) {
+                        if (!err2 && s.isDirectory()) result.push(name);
+                        if (--remaining === 0) cb(null, result.sort());
+                    });
+                })(entries[i]);
+            }
+        });
+    }
+
+    function drop(table, cb) {
+        if (shuttingDown) return cb({ code: 'SHUTTING_DOWN' });
+        var dbPath = path.join(dir, table);
+        var t = openTables[dbPath];
+        if (t) {
+            cancelIdle(t);
+            var doRemove = function() {
+                delete openTables[dbPath];
+                rmrf(dbPath, cb);
+            };
+            if (t.status === 'open' && t.db) {
+                closeTable(t, doRemove);
+            } else {
+                t.db = null;
+                t.status = 'closed';
+                doRemove();
+            }
+        } else {
+            rmrf(dbPath, cb);
+        }
+    }
+
     function close(cb) {
         shuttingDown = true;
-        var allPaths = Object.keys(tables);
+        var allPaths = Object.keys(openTables);
         var remaining = 0;
         var allCounted = false;
 
@@ -101,7 +153,7 @@ module.exports = function createEngine(opts) {
         }
 
         for (var i = 0; i < allPaths.length; i++) {
-            var t = tables[allPaths[i]];
+            var t = openTables[allPaths[i]];
             cancelIdle(t);
             if (t.processing) {
                 remaining++;
@@ -120,6 +172,16 @@ module.exports = function createEngine(opts) {
 
         allCounted = true;
         if (remaining === 0) cb(null);
+    }
+
+    // =====================================================================
+    // Scan options parser
+    // =====================================================================
+
+    function parseScanOpts(cursor) {
+        if (cursor === null || cursor === undefined) return { after: null, limit: 0 };
+        if (typeof cursor === 'string' || typeof cursor === 'number') return { after: cursor, limit: 0 };
+        return { after: cursor.after || null, limit: cursor.limit || 0 };
     }
 
     // =====================================================================
@@ -350,12 +412,12 @@ module.exports = function createEngine(opts) {
     // Scan
     // =====================================================================
 
-    function scanChunk(t, cursor, cb) {
+    function scanChunk(t, after, limit, cb) {
         t.scanning = true;
-        var pre = cursor === null ? flushWrites : noop;
+        var pre = after === null ? flushWrites : noop;
         pre(t, function() {
             var iterOpts = { fillCache: false };
-            if (cursor !== null) iterOpts.gt = keys.toKeyBuffer(cursor);
+            if (after !== null) iterOpts.gt = keys.toKeyBuffer(after);
             var iterator = t.db.iterator(iterOpts);
             var rows = []; var bytes = 0;
             readNext();
@@ -368,7 +430,7 @@ module.exports = function createEngine(opts) {
                     var value = new Uint8Array(pair[1]);
                     rows.push([key, value]);
                     bytes += pair[1].byteLength;
-                    if (bytes >= CHUNK_BYTES) {
+                    if (bytes >= CHUNK_BYTES || (limit > 0 && rows.length >= limit)) {
                         return iterator.close().then(function() { t.scanning = false; cb(null, rows, key, false); });
                     }
                     readNext();
@@ -383,26 +445,35 @@ module.exports = function createEngine(opts) {
     function noop(t, cb) { cb(); }
 
     // =====================================================================
+    // Count — O(n), keys-only iterator
+    // =====================================================================
+
+    function countRecords(t, cb) {
+        var n = 0;
+        var iterator = t.db.iterator({ values: false });
+        (function readNext() {
+            iterator.next().then(function(pair) {
+                if (!pair || pair[0] === undefined) {
+                    return iterator.close().then(function() { cb(n); })
+                    .catch(function() { cb(n); });
+                }
+                n++;
+                readNext();
+            }).catch(function() {
+                iterator.close().then(function() { cb(n); })
+                .catch(function() { cb(n); });
+            });
+        })();
+    }
+
+    // =====================================================================
     // Stat
     // =====================================================================
 
     function collectStat(t, cb) {
-        var count = 0;
-        var iterator = t.db.iterator({ fillCache: false });
-        function readNext() {
-            iterator.next().then(function(pair) {
-                if (!pair || pair[0] === undefined) {
-                    return iterator.close().then(function() {
-                        cb({ count: count, size: getDirSize(t.dbPath), status: t.status });
-                    });
-                }
-                count++; readNext();
-            }).catch(function() {
-                iterator.close().then(function() { cb({ count: count, size: 0, status: t.status }); })
-                .catch(function() { cb({ count: count, size: 0, status: t.status }); });
-            });
-        }
-        readNext();
+        countRecords(t, function(n) {
+            cb({ count: n, size: getDirSize(t.dbPath), status: t.status });
+        });
     }
 
     function getDirSize(dirPath) {
@@ -444,6 +515,13 @@ module.exports = function createEngine(opts) {
         try { fs.mkdirSync(dirPath, { recursive: true }); } catch (e) {}
     }
 
+    function rmrf(p, cb) {
+        (fs.rm || fs.rmdir).call(fs, p, { recursive: true }, function(err) {
+            if (err && err.code === 'ENOENT') return cb(null);
+            cb(err ? { code: 'DROP_FAILED', message: err.message } : null);
+        });
+    }
+
     // =====================================================================
     // Return public API
     // =====================================================================
@@ -453,6 +531,9 @@ module.exports = function createEngine(opts) {
         get: get,
         scan: scan,
         stat: stat,
+        count: count,
+        tables: listTables,
+        drop: drop,
         close: close
     };
 };
